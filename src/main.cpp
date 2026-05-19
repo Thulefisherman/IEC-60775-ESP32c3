@@ -5,7 +5,7 @@
 
 // --- 引脚定义 ---
 #define PIN_MOSFET 4 // IO4 控制电磁阀
-#define PIN_WS2812 1 // IO1 控制灯带
+#define PIN_WS2812 10 // IO10 控制灯带
 #define NUM_PIXELS 1 // 假设只有1颗灯珠
 
 // UUID 定义 (建议使用工具生成唯一的 UUID)
@@ -95,51 +95,42 @@ void saveData()
     Serial.println("数据已存入掉电存储");
 }
 
+// main_40.cpp
+
 void updateLocalConfig(DeviceDataTransfer *incoming)
 {
-    // 基础参数直接覆盖更新
+    // --- 权限 A：能读能写的配置项 (直接覆盖) ---
     myConfig.totalStages = incoming->totalStages;
+    // 转换单位（秒->毫秒）
     myConfig.onTime = (incoming->onTime < 100) ? (incoming->onTime * 1000) : incoming->onTime;
     myConfig.offTime = (incoming->offTime < 100) ? (incoming->offTime * 1000) : incoming->offTime;
     myConfig.targetCycles = incoming->targetCycles;
     myConfig.coolDownTime = incoming->coolDownTime;
-    // 2. 【核心保护逻辑】：参数熔断检查
-    // 检查是否有任何导致“无效运行”的参数为 0
-    bool isInvalidTask = (myConfig.totalStages == 0) || 
-                         (myConfig.targetCycles == 0) || 
-                         (myConfig.onTime == 0 && myConfig.offTime == 0);
 
-    if (isInvalidTask) {
-        Serial.println(">>> 检测到非法参数 (0)，系统强制进入 COMPLETED 状态以保护 Flash");
-        myConfig.status = COMPLETED;
-        // 既然是异常参数，后续的 currentStage 更新也将失去意义
-    } else {
-        myConfig.status = (SystemStatus)incoming->status;
-    }
-    // 进度参数：只有不是“保持信号”时才更新
-    // 对于 uint8，-1 等于 255
-    if (incoming->currentStage < 255)
+    // --- 权限 B：状态控制 ---
+    myConfig.status = (SystemStatus)incoming->status;
+
+    // --- 权限 C：进度控制 (只有在特定指令下才清零) ---
+    // 逻辑：如果收到 currentStage 为 0 且 status 为 STANDBY (2)，视为“清零”指令
+    if (incoming->currentStage == 0 && incoming->status == STANDBY)
     {
-        myConfig.currentStage = incoming->currentStage;
-        Serial.printf(">>> 有效阶段更新: %d\n", myConfig.currentStage);
+        Serial.println(">>> 触发重置指令：进度归零");
+        myConfig.currentStage = 0;
+        myConfig.currentCycles = 0;
+        myConfig.currentCoolDown = 0;
+        inCoolDown = false;
+        saveData(); // 立即存档
     }
     else
     {
-        Serial.println(">>> 收到保持信号 (255)，跳过阶段更新");
+        // 正常运行或暂停时，硬件忽略手机传来的 currentStage/Cycles，保持自己的进度
+        Serial.println(">>> 忽略手机端进度数据，保持硬件本地进度");
     }
 
-    // 同样拦截循环数（0xFFFFFFFF）
-    if (incoming->currentCycles != 0xFFFFFFFF)
+    // 非法参数检查
+    if (myConfig.totalStages == 0 || myConfig.targetCycles == 0)
     {
-        myConfig.currentCycles = incoming->currentCycles;
-    }
-
-    if (incoming->currentCoolDown != 0xFFFFFFFF)
-    {
-        myConfig.currentCoolDown = incoming->currentCoolDown;
-        // 如果被清零了，强制退出冷却状态
-        if (myConfig.currentCoolDown == 0)
-            inCoolDown = false;
+        myConfig.status = COMPLETED;
     }
 }
 
@@ -192,10 +183,27 @@ void loadData()
 class MyCallbacks : public NimBLECharacteristicCallbacks
 {
     // 在 MyCallbacks 类中修改
+    // main_40.cpp -> MyCallbacks 类
+
     void onRead(NimBLECharacteristic *pCharacteristic, NimBLEConnInfo &connInfo) override
     {
-        Serial.print(">>> 手机正在读取特征值: ");
-        Serial.println(pCharacteristic->getUUID().toString().c_str());
+        if (pCharacteristic->getUUID().equals(NimBLEUUID(CHAR_CONFIG_UUID)))
+        {
+            DeviceDataTransfer txData;
+
+            // 填充硬件当前的真实值
+            txData.totalStages = (uint8_t)myConfig.totalStages;
+            txData.currentStage = (uint8_t)myConfig.currentStage;
+            txData.onTime = (uint16_t)(myConfig.onTime / 1000);
+            txData.offTime = (uint16_t)(myConfig.offTime / 1000);
+            txData.targetCycles = (uint32_t)myConfig.targetCycles;
+            txData.currentCycles = (uint32_t)myConfig.currentCycles; // 关键：实时循环数
+            txData.coolDownTime = (uint8_t)myConfig.coolDownTime;
+            txData.currentCoolDown = (uint32_t)myConfig.currentCoolDown;
+            txData.status = (uint8_t)myConfig.status;
+
+            pCharacteristic->setValue((uint8_t *)&txData, sizeof(txData));
+        }
     }
     void onWrite(NimBLECharacteristic *pCharacteristic, NimBLEConnInfo &connInfo) override
     {
@@ -277,8 +285,8 @@ void setupBLE()
     DeviceDataTransfer initData;
     initData.totalStages = (uint8_t)myConfig.totalStages;
     initData.currentStage = (uint8_t)myConfig.currentStage;
-    initData.onTime = (uint16_t)myConfig.onTime;
-    initData.offTime = (uint16_t)myConfig.offTime;
+    initData.onTime = (uint16_t)(myConfig.onTime / 1000);   // 这里要除以 1000
+    initData.offTime = (uint16_t)(myConfig.offTime / 1000); // 这里要除以 1000[cite: 6]
     initData.targetCycles = (uint32_t)myConfig.targetCycles;
     initData.currentCycles = (uint32_t)myConfig.currentCycles;
     initData.coolDownTime = (uint8_t)myConfig.coolDownTime;
@@ -457,7 +465,7 @@ void loop()
         else
         {
             // --- 工作逻辑：吸合/断开循环 ---
-            
+
             unsigned long currentInterval = isValveOn ? myConfig.onTime : myConfig.offTime;
 
             if (currentMillis - previousMillis >= currentInterval)
@@ -507,7 +515,7 @@ void loop()
     {
         // --- 逻辑 A 的显示部分移到这里 ---
         digitalWrite(PIN_MOSFET, HIGH);                       // 确保阀门关闭
-        pixels.setPixelColor(0, pixels.Color(255, 255, 255));     // 持续显示白灯
+        pixels.setPixelColor(0, pixels.Color(255, 255, 255)); // 持续显示白灯
         pixels.show();
     }
 }
