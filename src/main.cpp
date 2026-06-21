@@ -2,17 +2,28 @@
 #include <Preferences.h>
 #include <Adafruit_NeoPixel.h>
 #include <NimBLEDevice.h>
+#include <Wire.h>
 
 // --- 引脚定义 ---
-#define PIN_MOSFET 4 // IO4 控制电磁阀
-#define PIN_WS2812 10 // IO10 控制灯带
+#define PIN_MOSFET 0 // IO1 控制电磁阀
+#define PIN_WS2812 7 // IO10 控制灯带
 #define NUM_PIXELS 1 // 假设只有1颗灯珠
+#define PIN_SQW 6    // DS3231 的 INT/SQW 连接到 IO6
+#define PIN_SDA 9    // DS3231 的 SDA 连接到 IO9
+#define PIN_SCL 8    // DS3231 的 SCL 连接到 IO8
 
 // UUID 定义 (建议使用工具生成唯一的 UUID)
 #define SERVICE_UUID "0000ABCD-0000-1000-8000-00805F9B34FB"
 #define CHAR_CONFIG_UUID "00001234-0000-1000-8000-00805F9B34FB"
 #define CHAR_NAME_UUID "00005678-0000-1000-8000-00805F9B34FB"
 #define CHAR_NOTIFY_UUID "00009ABC-0000-1000-8000-00805F9B34FB"
+
+// --- 新增中断控制变量 ---
+volatile bool rtcTickOccurred = false;
+volatile uint32_t rtcTotalSeconds = 0; // 自启动以来的总秒数
+
+// --- 全局增加一个目标时刻变量 ---
+uint32_t nextEventSeconds = 0;
 
 // --- 枚举定义 ---
 enum SystemStatus
@@ -90,7 +101,6 @@ void saveData()
     prefs.putInt("coolDown", myConfig.coolDownTime);
     prefs.putInt("currCoolDown", myConfig.currentCoolDown);
     prefs.putInt("status", (int)myConfig.status); // 存储枚举需强转为int
-
     prefs.end();
     Serial.println("数据已存入掉电存储");
 }
@@ -108,6 +118,11 @@ void updateLocalConfig(DeviceDataTransfer *incoming)
     myConfig.coolDownTime = incoming->coolDownTime;
 
     // --- 权限 B：状态控制 ---
+    if (myConfig.status != RUNNING && (SystemStatus)incoming->status == RUNNING)
+    {
+        // 刚开始运行，立即执行第一次动作
+        nextEventSeconds = rtcTotalSeconds;
+    }
     myConfig.status = (SystemStatus)incoming->status;
 
     // --- 权限 C：进度控制 (只有在特定指令下才清零) ---
@@ -119,6 +134,7 @@ void updateLocalConfig(DeviceDataTransfer *incoming)
         myConfig.currentCycles = 0;
         myConfig.currentCoolDown = 0;
         inCoolDown = false;
+        nextEventSeconds = rtcTotalSeconds;
         saveData(); // 立即存档
     }
     else
@@ -152,6 +168,10 @@ void notifyStatusUpdate()
 
         pNotifyChar->setValue((uint8_t *)&txData, sizeof(txData));
         pNotifyChar->notify();
+
+        // --- 新增：打印通知发送的时刻与核心参数 ---
+        Serial.printf("[BLE通知] 已成功发送 -> 毫秒级时间戳: %lu ms | RTC总秒数: %u s | 状态: %d | 循环数: %d/%d | 剩余冷却: %u s\n", 
+                      millis(), rtcTotalSeconds, myConfig.status, myConfig.currentCycles, myConfig.targetCycles, myConfig.currentCoolDown);
     }
 }
 // --- 读取数据 ---
@@ -166,7 +186,7 @@ void loadData()
     myConfig.onTime = prefs.getInt("onTime", 1000);
     myConfig.offTime = prefs.getInt("offTime", 1000);
     myConfig.targetCycles = prefs.getInt("targetCycles", 10);
-    myConfig.currentCycles = prefs.getInt("currCycles", 1000);
+    myConfig.currentCycles = prefs.getInt("currCycles", 0);
     myConfig.coolDownTime = prefs.getInt("coolDown", 5000);
     myConfig.status = (SystemStatus)prefs.getInt("status", (int)STANDBY);
     myConfig.currentCoolDown = prefs.getInt("currCoolDown", 0);
@@ -252,18 +272,20 @@ class MyCallbacks : public NimBLECharacteristicCallbacks
 
 class MyServerCallbacks : public NimBLEServerCallbacks
 {
-    void onConnect(NimBLEServer *pServer)
+    // 加上 NimBLEConnInfo& 参数，并建议加上 override 强制校验
+    void onConnect(NimBLEServer *pServer, NimBLEConnInfo &connInfo) override
     {
         Serial.println(">>> 手机已连接");
         notifyStatusUpdate();
     };
 
-    void onDisconnect(NimBLEServer *pServer)
+    void onDisconnect(NimBLEServer *pServer, NimBLEConnInfo &connInfo, int reason) override
     {
-        Serial.println(">>> 手机已断开");
-        // 某些安卓机型断开极快，延迟 500ms 重启广播更稳
-        delay(500);
+        Serial.printf(">>> 手机已断开，原因代码: %d\n", reason);
+
+        // 重新启动广播，这样手机才能再次搜到它
         NimBLEDevice::startAdvertising();
+        Serial.println(">>> 已重新启动广播...");
     }
 };
 
@@ -368,6 +390,13 @@ void updateRunningLights()
     pixels.setPixelColor(0, pixels.Color(r, g, b));
     pixels.show();
 }
+// --- 中断服务函数 (ISR) ---
+// 放在 IRAM 中以保证运行速度
+void IRAM_ATTR onRtcInterrupt()
+{
+    rtcTickOccurred = true;
+    rtcTotalSeconds++;
+}
 
 void setup()
 {
@@ -379,124 +408,122 @@ void setup()
     pixels.begin();
     loadData(); // 加载存储
     setupBLE(); // 开启蓝牙服务
+    Wire.begin(PIN_SDA, PIN_SCL);
+
+    Wire.beginTransmission(0x68); // DS3231 地址
+    Wire.write(0x0E);             // 控制寄存器
+    // BBSQW=1, RS2=0, RS1=0, INTCN=0 (使能1Hz方波输出)
+    Wire.write(0b01000000);
+    Wire.endTransmission();
+
+    pinMode(PIN_SQW, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(PIN_SQW), onRtcInterrupt, FALLING);
 }
 
 unsigned long lastBlePrintMillis = 0;
 const unsigned long BLE_PRINT_INTERVAL = 5000; // 10秒
 void loop()
 {
-    unsigned long currentMillis = millis();
-    static unsigned long lastSecondMillis = 0; // 用于秒级倒计时
-
-    // --- 新增：每10秒打印一次蓝牙MAC地址 ---
-    if (currentMillis - lastBlePrintMillis >= BLE_PRINT_INTERVAL)
-    {
-        lastBlePrintMillis = currentMillis;
-        lastBlePrintMillis = currentMillis;
-
-        bool isAdvertising = NimBLEDevice::getAdvertising()->isAdvertising();
-        int connCount = pServer->getConnectedCount();
-
-        // Serial.printf("[BLE] 连接数: %d | 广播状态: %s \n",
-        //               connCount, isAdvertising ? "运行中" : "已停止");
-
-        // 如果没连接且没广播，手动补救
-        if (connCount == 0 && !isAdvertising)
-        {
-            Serial.println("[FIX] 强制重启广播...");
-            NimBLEDevice::getAdvertising()->start();
-        }
-        // 获取并打印地址
-        // NimBLEAddress localAddress = NimBLEDevice::getAddress();
-        // Serial.print("[BLE DEBUG] 设备名称: ");
-        // Serial.print(myConfig.bleName);
-        // Serial.print(" | MAC地址: ");
-        // Serial.println(localAddress.toString().c_str());
-
-        // 顺便检查连接状态，方便调试
-        Serial.printf("[DEBUG] 状态:%d | 阶段:%d/%d | 循环:%d/%d | 冷却:%d/%d \n",
-                      myConfig.status, myConfig.currentStage, myConfig.totalStages, myConfig.currentCycles,
-                      myConfig.targetCycles, myConfig.currentCoolDown, myConfig.coolDownTime * 3600);
-    }
-    // 1. 只有在运行状态下才执行逻辑
+    // 依然保留给灯效，因为灯效需要毫秒级的平滑度
     if (myConfig.status == RUNNING)
     {
-        // 检查是否所有阶段已完成
-        if (myConfig.currentStage >= myConfig.totalStages && myConfig.currentStage != 255)
-        {
-            myConfig.status = COMPLETED;
-            saveData(); // 这里存一次就够了
-            notifyStatusUpdate();
-            return;
-        }
         updateRunningLights();
-        // 2. 核心分支：冷却中 VS 工作中
-        if (inCoolDown)
+    }
+    // --- 核心：RTC 驱动的逻辑 ---
+    if (rtcTickOccurred)
+    {
+        rtcTickOccurred = false;
+
+        // 获取当前绝对秒数（增加临界区保护，防止读取时被中断修改）
+        noInterrupts();
+        uint32_t now = rtcTotalSeconds;
+        interrupts();
+
+        if (myConfig.status == RUNNING)
         {
-            // --- 【冷却逻辑】 ---
-            digitalWrite(PIN_MOSFET, HIGH); // 确保电磁阀断开
-            // 每隔 1 秒处理一次倒计时
-            if (currentMillis - lastSecondMillis >= 1000)
+            // 阶段检查
+            if (myConfig.currentStage >= myConfig.totalStages && myConfig.currentStage != 255)
             {
-                lastSecondMillis = currentMillis;
+                myConfig.status = COMPLETED;
+                saveData();
+                notifyStatusUpdate();
+                return;
+            }
 
-                if (myConfig.currentCoolDown > 0)
+            // --- 状态机处理 ---
+            if (inCoolDown)
+            {
+                // 冷却逻辑
+                if (now >= nextEventSeconds)
                 {
-                    myConfig.currentCoolDown--;
+                    inCoolDown = false;
+                    myConfig.currentStage++;
+                    myConfig.currentCycles = 0;
+                    myConfig.currentCoolDown = 0;
 
-                    // --- 每 5 秒通知一次手机 ---
-                    if (myConfig.currentCoolDown % 5 == 0)
-                    {
-                        notifyStatusUpdate();
-                    }
+                    // 冷却结束，计算下一次吸合的结束时刻
+                    nextEventSeconds = now + (myConfig.onTime / 1000);
+                    isValveOn = true;
+                    digitalWrite(PIN_MOSFET, LOW); // 开启
+
+                    smartSave(true);
+                    notifyStatusUpdate();
+                    Serial.println(">>> 冷却结束，进入下一阶段吸合");
                 }
                 else
                 {
-                    // 倒计时结束，切换回工作状态
-                    inCoolDown = false;
-                    myConfig.currentStage++;    // 进入下一阶段
-                    myConfig.currentCycles = 0; // 重置循环
-                    smartSave(true);            // 重要节点强制存档
-                    notifyStatusUpdate();
-                    Serial.println(">>> 冷却结束，开始下一阶段工作");
+                    // 更新剩余冷却秒数用于显示
+                    myConfig.currentCoolDown = nextEventSeconds - now;
+                    //if (myConfig.currentCoolDown % 5 == 0)
+                        notifyStatusUpdate();
                 }
             }
-        }
-        else
-        {
-            // --- 工作逻辑：吸合/断开循环 ---
-
-            unsigned long currentInterval = isValveOn ? myConfig.onTime : myConfig.offTime;
-
-            if (currentMillis - previousMillis >= currentInterval)
+            else
             {
-                previousMillis = currentMillis;
-                if (!isValveOn)
-                {
-                    isValveOn = true;
-                    digitalWrite(PIN_MOSFET, LOW); // 吸合
-                }
-                else
-                {
-                    isValveOn = false;
-                    digitalWrite(PIN_MOSFET, HIGH); // 断开
-                    myConfig.currentCycles++;
-                    notifyStatusUpdate();
-
-                    // 检查是否需要进入冷却
-                    if (myConfig.currentCycles >= myConfig.targetCycles)
+                // 正常循环逻辑（吸合/断开）
+                if (now >= nextEventSeconds)
+                { 
+                    if (isValveOn)
                     {
-                        inCoolDown = true;
-                        myConfig.currentCoolDown = (uint32_t)myConfig.coolDownTime * 3600;
-                        smartSave(true); // 阶段性强制存档一次[cite: 10]
-                        notifyStatusUpdate();
+                        // 准备转为断开
+                        isValveOn = false;
+                        digitalWrite(PIN_MOSFET, HIGH);
+                        myConfig.currentCycles++;
+
+                        // 计算下一次断开结束的时刻
+                        nextEventSeconds = now + (myConfig.offTime / 1000);
+
+                        // 检查是否该进入冷却
+                        if (myConfig.currentCycles >= myConfig.targetCycles)
+                        {
+                            inCoolDown = true;
+                            nextEventSeconds = now + ((uint32_t)myConfig.coolDownTime * 3600);
+                            smartSave(true);
+                        }
+                        else
+                        {
+                            smartSave(false);
+                        }
                     }
                     else
                     {
-                        smartSave(false); // 正常 100次/15分钟 智能存储[cite: 10]
+                        // 准备转为吸合
+                        isValveOn = true;
+                        digitalWrite(PIN_MOSFET, LOW);
+                        Serial.printf("xxxxxx");
+                        // 计算下一次吸合结束的时刻
+                        nextEventSeconds = now + (myConfig.onTime / 1000);
                     }
+                    notifyStatusUpdate();
                 }
             }
+        }
+
+        // 每10秒打印一次状态
+        if (now % 10 == 0)
+        {
+            Serial.printf("[RTC] 阶段:%d | 循环:%d/%d | 目标时刻:%u | 当前:%u\n",
+                          myConfig.currentStage, myConfig.currentCycles, myConfig.targetCycles, nextEventSeconds, now);
         }
     }
     else if (myConfig.status == PAUSED)
